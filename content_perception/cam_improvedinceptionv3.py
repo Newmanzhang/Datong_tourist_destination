@@ -1,26 +1,70 @@
-from __future__ import print_function
-from __future__ import division
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import numpy as np
-import torchvision
-from PIL import Image
-from torchvision import datasets, models, transforms
-import matplotlib.pyplot as plt
-import time
+from torch.autograd import Variable as V
 import math
-import shutil
-import cv2
-import os
-import copy
-import argparse
-import torch.utils.model_zoo as model_zoo
+from torchvision import transforms as trn
 from torch.nn import functional as F
-from torchvision.io.image import read_image
-from torchvision.transforms.functional import normalize, resize, to_pil_image
-from torchcam.methods import GradCAM
-from torchcam.utils import overlay_mask
+import numpy as np
+import cv2
+from PIL import Image, ExifTags
+
+def imreadRotate(fn):
+    image=Image.open(fn)
+    try:
+        for orientation in ExifTags.TAGS.keys():
+            if ExifTags.TAGS[orientation]=='Orientation':
+                break
+        exif=dict(image._getexif().items())
+        if exif[orientation] == 3:
+            image=image.rotate(180, expand=True)
+        elif exif[orientation] == 6:
+            image=image.rotate(270, expand=True)
+        elif exif[orientation] == 8:
+            image=image.rotate(90, expand=True)
+    except (AttributeError, KeyError, IndexError):
+        # cases: image don't have getexif
+        print('dont rotate')
+        pass
+    return image
+
+def load_labels():
+    # prepare all the labels
+    # scene category relevant
+    file_name_category = 'categories_places365.txt'
+    classes = list()
+    with open(file_name_category) as class_file:
+        for line in class_file:
+            classes.append(line.strip().split(' ')[0][3:])
+    classes = tuple(classes)
+
+    return classes
+
+def hook_feature(module, input, output):
+    features_blobs.append(np.squeeze(output.data.cpu().numpy()))
+
+def returnCAM(feature_conv, weight_softmax, class_idx):
+    # generate the class activation maps upsample to 256x256
+    size_upsample = (256, 256)
+    nc, h, w = feature_conv.shape
+    output_cam = []
+    for idx in class_idx:
+        cam = weight_softmax[class_idx].dot(feature_conv.reshape((nc, h*w)))
+        cam = cam.reshape(h, w)
+        cam = cam - np.min(cam)
+        cam_img = cam / np.max(cam)
+        cam_img = np.uint8(255 * cam_img)
+        output_cam.append(cv2.resize(cam_img, size_upsample))
+    return output_cam
+
+def returnTF():
+# load the image transformer
+    tf = trn.Compose([
+        trn.Resize((299,299)),
+        trn.ToTensor(),
+        trn.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    return tf
+
 
 class Inception3(nn.Module):
 
@@ -439,18 +483,72 @@ def inception_v3(pretrained=False, **kwargs):
     return Inception3(**kwargs)
 
 
-model =inception_v3()
-weights = torch.load('./checkpointimprovedinceptionv3.pth.tar_best.pth.tar', map_location=lambda storage, loc: storage)
-model.load_state_dict(weights["state_dict"])
-model=model.eval()
-cam_extractor = GradCAM(model,'Mixed_7c')
-img = read_image("./real/1.jpg")
-# Preprocess it for your chosen model
-input_tensor = normalize(resize(img, (299, 299)) / 255., [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 
-# Preprocess your data and feed it to the model
-out = model(input_tensor.unsqueeze(0))
-# Retrieve the CAM by passing the class index and the model output
-activation_map = cam_extractor(out.squeeze(0).argmax().item(), out)
-plt.imshow(activation_map[0].squeeze(0).numpy()); plt.axis('off'); plt.tight_layout(); plt.show()
+def load_model():
+    # this model has a last conv feature map as 14x14
+
+
+    model = inception_v3()
+    weights = torch.load('./checkpointimprovedinceptionv3.pth.tar_best.pth.tar', map_location=lambda storage, loc: storage)
+    model.load_state_dict(weights["state_dict"])
+    model.eval()
+    # hook the feature extractor
+    features_names = ['Mixed_7c'] # this is the last conv layer of the resnet
+    for name in features_names:
+        model._modules.get(name).register_forward_hook(hook_feature)
+    return model
+
+# load the labels
+classes= load_labels()
+# load the model
+features_blobs = []
+model = load_model()
+# load the transformer
+tf = returnTF() # image transformer
+# get the softmax weight
+params = list(model.parameters())
+weight_softmax = params[-2].data.numpy()
+# retrieve and predict the uploaded images
+sourceFolder =  './real';
+
+import glob
+import time
+# first clean up the uploaded images (from last crash)
+images = glob.glob(sourceFolder + '/*.jpg')
+
+
+print('standby ...')
+num_total = 0
+
+while num_total<=6:
+    time.sleep(1)
+    images = glob.glob(sourceFolder + '/*.jpg')
+    for imgfile in images:
+
+            #del features_blobs[:]
+            print('processing ' + imgfile)
+            num_total = num_total + 1
+            img = imreadRotate(imgfile)
+            input_img = V(tf(img).unsqueeze(0), volatile=True)
+            # forward pass
+            logit = model.forward(input_img)
+            h_x = F.softmax(logit).data.squeeze()
+            probs, idx = h_x.sort(0, True)
+            # output the prediction of scene category
+            out = []
+            for i in range(0, 5):
+                print('{:.3f} -> {}'.format(probs[i], classes[idx[i]]))
+                if i==0 or probs[i]>0.10:
+                    out.append('%s (%.3f)' % (classes[idx[i]], probs[i]))
+
+            CAMs = returnCAM(features_blobs[0], weight_softmax, [idx[0]])
+
+            # render the CAM and output
+            img = cv2.imread(imgfile)
+            height, width, _ = img.shape
+            heatmap = cv2.applyColorMap(cv2.resize(CAMs[0], (width, height)), cv2.COLORMAP_JET)
+            result = heatmap * 0.4 + img * 0.5
+            result = cv2.resize(result, (int(width*300/height), 300))
+            cv2.imwrite(str(num_total)+'.jpg', result)
+
 
